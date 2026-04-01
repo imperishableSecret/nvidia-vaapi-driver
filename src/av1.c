@@ -11,6 +11,15 @@ static int get_relative_dist(CUVIDAV1PICPARAMS *pps, int ref_hint, int order_hin
     return (diff & (m - 1)) - (diff & m);
 }
 
+#define MOS_ALIGN_CEIL(_a, _alignment) (((_a) + ((_alignment)-1)) & (~((_alignment)-1)))
+
+static uint32_t CalcAv1TileLog2(uint32_t blockSize, uint32_t target)
+{
+    uint32_t k;
+    for (k = 0; (blockSize << k) < target; k++) {}
+    return k;
+}
+
 static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *picParams) {
     static const int bit_depth_map[] = {0, 2, 4}; //8-bpc, 10-bpc, 12-bpc
 
@@ -23,9 +32,10 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
     picParams->intra_pic_flag    = buf->pic_info_fields.bits.frame_type == 0 || //Key
                                    buf->pic_info_fields.bits.frame_type == 2; //Intra-Only
 
-    //TODO if it's not a key or switch frame type, it still *might* be a ref_pic
-    picParams->ref_pic_flag      = buf->pic_info_fields.bits.frame_type == 0 ||
-                                  (buf->pic_info_fields.bits.frame_type == 3 && buf->pic_info_fields.bits.show_frame);
+    // In AV1, virtually all frames update the DPB (refresh_frame_flags != 0).
+    // VA-API doesn't expose refresh_frame_flags directly, so mark all frames
+    // as reference frames unconditionally. This matches FFmpeg's approach.
+    picParams->ref_pic_flag      = 1;
 
     pps->width = ctx->width;
     pps->height = ctx->height;
@@ -47,8 +57,9 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
     pps->enable_order_hint = buf->seq_info_fields.fields.enable_order_hint;
     pps->order_hint_bits_minus1 = buf->order_hint_bits_minus_1;
     pps->enable_jnt_comp = buf->seq_info_fields.fields.enable_jnt_comp;
-    //TODO not quite correct, use_superres can be 0, and enable_superres can be 1
-    pps->enable_superres = buf->pic_info_fields.bits.use_superres;
+    // VA-API doesn't expose the sequence-level enable_superres flag directly.
+    // Set it unconditionally; whether a specific frame uses superres is gated by use_superres.
+    pps->enable_superres = 1;
     pps->enable_cdef = buf->seq_info_fields.fields.enable_cdef;
     //TODO this flag just seems to be missing from libva, however we should be able to recover it from the lr_type fields
     pps->enable_restoration = buf->loop_restoration_fields.bits.yframe_restoration_type != 0 ||
@@ -210,11 +221,57 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
     pps->cr_luma_mult = buf->film_grain_info.cr_luma_mult;
     pps->cr_offset = buf->film_grain_info.cr_offset;
 
-    for (int i = 0; i < pps->num_tile_cols; i++) {
-        pps->tile_widths[i] = 1 + buf->width_in_sbs_minus_1[i];
-    }
-    for (int i = 0; i < pps->num_tile_rows; i++) {
-        pps->tile_heights[i] = 1 + buf->height_in_sbs_minus_1[i];
+    
+
+     if (!buf->pic_info_fields.bits.uniform_tile_spacing_flag) {
+        for (int i = 0; i < pps->num_tile_cols; i++) {
+            pps->tile_widths[i] = 1 + buf->width_in_sbs_minus_1[i];
+        }
+        for (int i = 0; i < pps->num_tile_rows; i++) {
+            pps->tile_heights[i] = 1 + buf->height_in_sbs_minus_1[i];
+        }
+    } else {
+        uint32_t widthMinus1 = buf->frame_width_minus1;
+        if (buf->pic_info_fields.bits.use_superres &&
+            buf->superres_scale_denominator != 8) { // av1ScaleNumerator
+            uint32_t dsWidth = ((widthMinus1 + 1) * 8 + buf->superres_scale_denominator / 2)
+                / buf->superres_scale_denominator;
+            widthMinus1 = dsWidth - 1;
+        }
+
+        const uint32_t maxMibSizeLog2 = 5;
+        const uint32_t minMibSizeLog2 = 4;
+        const uint32_t miSizeLog2     = 2;
+        int32_t mibSizeLog2 = buf->seq_info_fields.fields.use_128x128_superblock ? maxMibSizeLog2 : minMibSizeLog2;
+        int32_t miCols = MOS_ALIGN_CEIL(MOS_ALIGN_CEIL(widthMinus1 + 1, 8) >> miSizeLog2, 1 << mibSizeLog2);
+        int32_t miRows = MOS_ALIGN_CEIL(MOS_ALIGN_CEIL(buf->frame_height_minus1 + 1, 8) >> miSizeLog2, 1 << mibSizeLog2);
+        int32_t sbCols = miCols >> mibSizeLog2;
+        int32_t sbRows = miRows >> mibSizeLog2;
+
+        uint32_t tileColsLog2 = CalcAv1TileLog2(1, pps->num_tile_cols);
+        uint32_t tileRowsLog2 = CalcAv1TileLog2(1, pps->num_tile_rows);
+
+        uint32_t sizeSb = MOS_ALIGN_CEIL(sbCols, 1 << tileColsLog2);
+        sizeSb >>= tileColsLog2;
+        uint32_t sizeSbRemain = sbCols % sizeSb;
+        if (!sizeSbRemain) sizeSbRemain = sizeSb;
+
+        int i;
+        for (i = 0; i < pps->num_tile_cols - 1; i++) {
+            pps->tile_widths[i] = sizeSb;
+        }
+        pps->tile_widths[i] = sizeSbRemain;
+
+        sizeSb = MOS_ALIGN_CEIL(sbRows, 1 << tileRowsLog2);
+        sizeSb >>= tileRowsLog2;
+        sizeSbRemain = sbRows % sizeSb;
+        if (!sizeSbRemain) sizeSbRemain = sizeSb;
+
+        for (i = 0; i < pps->num_tile_rows - 1; i++) {
+            pps->tile_heights[i] = sizeSb;
+        }
+        pps->tile_heights[i] = sizeSbRemain;
+#undef MOS_ALIGN_CEIL
     }
 
     for (int i = 0; i < (1<<pps->cdef_bits); i++) {
@@ -233,15 +290,16 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
         }
     }
 
-    //TODO i think it is correct
     pps->coded_lossless = 1;
     if (buf->y_dc_delta_q != 0 || buf->u_dc_delta_q != 0 || buf->v_dc_delta_q != 0 || buf->u_ac_delta_q != 0 || buf->v_ac_delta_q != 0) {
         pps->coded_lossless = 0;
     } else {
         for (int i = 0; i < 8; i++) {
-            if (((pps->segmentation_feature_mask[i] & 1) != 0
-                && (pps->base_qindex + pps->segmentation_feature_data[i][0] != 0))
-                || pps->base_qindex != 0) {
+            int qindex = (pps->segmentation_feature_mask[i] & 1)
+                ? pps->base_qindex + pps->segmentation_feature_data[i][0]
+                : pps->base_qindex;
+            qindex = qindex < 0 ? 0 : qindex > 255 ? 255 : qindex;
+            if (qindex != 0) {
                 pps->coded_lossless = 0;
                 break;
             }
@@ -259,14 +317,13 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
         int ref_idx = buf->ref_frame_idx[i];
         pps->ref_frame[i].index = pps->ref_frame_map[ref_idx];
         //pull these from the surface itself
-        NVSurface *surf = nvSurfaceFromSurfaceId(ctx->drv, buf->ref_frame_map[i]);
+        NVSurface *surf = nvSurfaceFromSurfaceId(ctx->drv, buf->ref_frame_map[ref_idx]);
         if (surf != NULL) {
             pps->ref_frame[i].width = surf->width;
             pps->ref_frame[i].height = surf->height;
         }
 
-        //TODO not sure on this one
-        pps->global_motion[i].invalid = (buf->wm[i].wmtype == 0);
+        pps->global_motion[i].invalid = buf->wm[i].invalid;
         pps->global_motion[i].wmtype = buf->wm[i].wmtype;
         for (int j = 0; j < 6; j++) {
             pps->global_motion[i].wmmat[j] = buf->wm[i].wmmat[j];
@@ -274,13 +331,15 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
     }
 
     if (pps->apply_grain) {
-        for (int i = 0; i < 14; i++) {
+        for (int i = 0; i < pps->num_y_points; i++) {
             pps->scaling_points_y[i][0] = buf->film_grain_info.point_y_value[i];
             pps->scaling_points_y[i][1] = buf->film_grain_info.point_y_scaling[i];
         }
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < pps->num_cb_points; i++) {
             pps->scaling_points_cb[i][0] = buf->film_grain_info.point_cb_value[i];
             pps->scaling_points_cb[i][1] = buf->film_grain_info.point_cb_scaling[i];
+        }
+        for (int i = 0; i < pps->num_cr_points; i++) {
             pps->scaling_points_cr[i][0] = buf->film_grain_info.point_cr_value[i];
             pps->scaling_points_cr[i][1] = buf->film_grain_info.point_cr_scaling[i];
         }
@@ -299,28 +358,28 @@ static void copyAV1PicParam(NVContext *ctx, NVBuffer* buffer, CUVIDPICPARAMS *pi
 }
 
 static void copyAV1SliceParam(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams) {
-    ctx->lastSliceParams = buf->ptr;
-    ctx->lastSliceParamsCount = buf->elements;
-
-    picParams->nNumSlices += buf->elements;
-}
-
-static void copyAV1SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams) {
-    uint32_t offset = (uint32_t) ctx->bitstreamBuffer.size;
-    for (unsigned int i = 0; i < ctx->lastSliceParamsCount; i++) {
-        VASliceParameterBufferAV1 *sliceParams = &((VASliceParameterBufferAV1*) ctx->lastSliceParams)[i];
-
-        //copy just the slice we're looking at
-        appendBuffer(&ctx->bitstreamBuffer, PTROFF(buf->ptr, sliceParams->slice_data_offset), sliceParams->slice_data_size);
-
-        //now append the offset and size of the slice we just copied
+    for (unsigned int i = 0; i < buf->elements; i++) {
+        VASliceParameterBufferAV1 *sliceParams = &((VASliceParameterBufferAV1*) buf->ptr)[i];
+        // append the slice offsets relative to the concatenated bitstream buffer
+        uint32_t offset = sliceParams->slice_data_offset + ctx->lastSliceDataOffset;
         appendBuffer(&ctx->sliceOffsets, &offset, sizeof(offset));
         offset += sliceParams->slice_data_size;
         appendBuffer(&ctx->sliceOffsets, &offset, sizeof(offset));
     }
 
+    picParams->nNumSlices += buf->elements;
+}
+
+static void copyAV1SliceData(NVContext *ctx, NVBuffer* buf, CUVIDPICPARAMS *picParams) {
+    appendBuffer(&ctx->bitstreamBuffer, buf->ptr, buf->size);
+    // Track accumulated offset for multi-buffer concatenation
+    if (ctx->sliceOffsets.size) {
+        ctx->lastSliceDataOffset += buf->size;
+    }
+
     picParams->nBitstreamDataLen = ctx->bitstreamBuffer.size;
 }
+
 
 static cudaVideoCodec computeAV1CudaCodec(VAProfile profile) {
     switch (profile) {

@@ -1349,6 +1349,12 @@ static VAStatus nvBeginPicture(
     nvCtx->renderTarget = surface;
     nvCtx->renderTarget->progressiveFrame = true; //assume we're producing progressive frame unless the codec says otherwise
     nvCtx->pPicParams.CurrPicIdx = nvCtx->renderTarget->pictureIdx;
+
+
+    nvCtx->bitstreamBuffer.size = 0;
+    nvCtx->sliceOffsets.size = 0;
+    nvCtx->lastSliceDataOffset = 0;
+
     if (nvCtx->codec != NULL && nvCtx->codec->beginPicture != NULL) {
         nvCtx->codec->beginPicture(nvCtx);
     }
